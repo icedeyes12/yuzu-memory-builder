@@ -1,6 +1,6 @@
 #!/usr/bin/env pyt
 [truncated]
-ass MemoryPipeline
+class MemoryPipeline
 [truncated]
 c with MemoryPipeline() as pipeline:
         await pipeline.run(phases)
