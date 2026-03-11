@@ -1,85 +1,71 @@
-"""Phase 1: Export from SQLite to DuckDB"""
+"""Phase 1: Export from Supabase to DuckDB"""
 
-import sqlite3
-from pathlib import Path
 from typing import Dict
 from rich.progress import Progress, TaskID
+from ..core.supabase_client import SupabaseClient
+from ..core.duckdb_server import DuckDBServer
 
 
 class ExportPhase:
-    """Export messages and sessions from SQLite"""
+    """Export messages and sessions from Supabase to local DuckDB"""
     
-    def __init__(self, sqlite_path: str, duckdb_server):
-        self.sqlite_path = Path(sqlite_path)
+    def __init__(self, supabase_client: SupabaseClient, duckdb_server: DuckDBServer):
+        self.supabase = supabase_client
         self.duckdb = duckdb_server
         
     def run(self, progress: Progress, task: TaskID) -> Dict[str, int]:
         """Export all data to DuckDB"""
         
-        if not self.sqlite_path.exists():
-            raise FileNotFoundError(f"SQLite not found: {self.sqlite_path}")
-            
-        # Connect to SQLite
-        sqlite_conn = sqlite3.connect(str(self.sqlite_path))
-        sqlite_conn.row_factory = sqlite3.Row
+        # Fetch sessions
+        print("📦 Fetching sessions from Supabase...")
+        sessions = self.supabase.fetch_sessions()
         
-        try:
-            # Export sessions
-            cur = sqlite_conn.execute("SELECT id, title, created_at FROM chat_sessions")
-            sessions = [tuple(row) for row in cur.fetchall()]
+        # Insert to DuckDB
+        self.duckdb.execute("BEGIN TRANSACTION")
+        for session in sessions:
+            self.duckdb.execute(
+                "INSERT INTO sessions_export VALUES (?, ?, ?, ?)",
+                (session['id'], session['user_id'], session['title'], session['created_at'])
+            )
+        self.duckdb.execute("COMMIT")
+        
+        # Fetch messages in batches
+        print("📦 Fetching messages from Supabase...")
+        total_messages = 0
+        batch_size = 500
+        
+        # Get total count first
+        count_result = self.supabase.fetch_messages(limit=1, offset=0)
+        estimated_total = self.supabase.get_messages_count()
+        
+        progress.update(task, total=estimated_total)
+        
+        offset = 0
+        while True:
+            messages = self.supabase.fetch_messages(limit=batch_size, offset=offset)
+            if not messages:
+                break
             
+            # Insert batch
             self.duckdb.execute("BEGIN TRANSACTION")
-            for session in sessions:
+            for msg in messages:
                 self.duckdb.execute(
-                    "INSERT INTO sessions_export VALUES (?, ?, ?)",
-                    session
+                    "INSERT INTO messages_export VALUES (?, ?, ?, ?, ?, ?)",
+                    (msg['id'], msg['session_id'], msg['user_id'], 
+                     msg['role'], msg['content'], msg['created_at'])
                 )
             self.duckdb.execute("COMMIT")
             
-            # Export messages
-            cur = sqlite_conn.execute("""
-                SELECT m.id, m.session_id, m.role, m.content, m.created_at
-                FROM messages m
-                ORDER BY m.session_id, m.created_at
-            """)
+            total_messages += len(messages)
+            offset += batch_size
+            progress.update(task, completed=min(total_messages, estimated_total))
             
-            batch = []
-            total = 0
-            
-            while True:
-                rows = cur.fetchmany(1000)
-                if not rows:
-                    break
-                    
-                batch.extend([tuple(row) for row in rows])
-                total += len(rows)
+            if len(messages) < batch_size:
+                break
                 
-                if len(batch) >= 5000:
-                    self._insert_batch(batch)
-                    batch = []
-                    progress.update(task, completed=total)
-                    
-            # Insert remaining
-            if batch:
-                self._insert_batch(batch)
-                progress.update(task, completed=total)
-                
-        finally:
-            sqlite_conn.close()
-            
         # Return stats
         stats = self.duckdb.get_stats()
         return {
             'sessions': stats.get('sessions_count', 0),
             'messages': stats.get('messages_count', 0)
         }
-        
-    def _insert_batch(self, batch):
-        """Insert batch to DuckDB"""
-        self.duckdb.execute("BEGIN TRANSACTION")
-        for row in batch:
-            self.duckdb.execute(
-                "INSERT INTO messages_export VALUES (?, ?, ?, ?, ?)",
-                row
-            )
-        self.duckdb.execute("COMMIT")

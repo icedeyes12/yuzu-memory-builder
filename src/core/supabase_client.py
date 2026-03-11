@@ -156,6 +156,38 @@ class SupabaseClient:
                 'semantic_count': semantic
             }
             
+    def fetch_sessions(self, user_id: int) -> List[Dict]:
+        """Fetch chat sessions for a user"""
+        with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT * FROM chat_sessions WHERE user_id = %s
+            """, (user_id,))
+            return cur.fetchall()
+            
+    def fetch_messages(self, session_id: int) -> List[Dict]:
+        """Fetch messages for a chat session"""
+        with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT * FROM messages WHERE session_id = %s
+            """, (session_id,))
+            return cur.fetchall()
+            
+    def fetch_memories(self, user_id: int) -> List[Dict]:
+        """Fetch all memories for a user"""
+        with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT * FROM memories WHERE user_id = %s
+            """, (user_id,))
+            return cur.fetchall()
+            
+    def fetch_semantic_memories(self, user_id: int) -> List[Dict]:
+        """Fetch all semantic memories for a user"""
+        with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT * FROM semantic_memories WHERE user_id = %s
+            """, (user_id,))
+            return cur.fetchall()
+            
     @staticmethod
     def _batch(items: List[Any], size: int):
         """Split list into batches"""
