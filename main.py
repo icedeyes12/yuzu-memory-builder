@@ -40,11 +40,12 @@ console = Console()
 class MemoryBuilderApp:
     """Main application orchestrator"""
     
-    def __init__(self):
-        self.config = Config.from_env()
-        self.duckdb: Optional[DuckDBServer] = None
-        self.onnx: Optional[ONNXServer] = None
-        self.supabase: Optional[SupabaseClient] = None
+    async def __init__(self):
+        self.console = Console()
+        self.config = Config()  # BaseSettings auto-loads from env
+        self.duckdb = None
+        self.supabase = None
+        self.onnx = None
         self.running = False
         
     async def __aenter__(self):
