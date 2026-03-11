@@ -149,10 +149,11 @@ class MemoryPipeline:
                     embeddings = self.onnx.embed(texts)
                     
                     # Store with embeddings
+                    from datetime import datetime
                     for b, emb in zip(batch, embeddings):
                         self.duckdb.execute(
-                            "INSERT INTO memories_with_embeddings VALUES (?, ?, ?, ?, ?, ?, ?)",
-                            [b['id'], 1, b['session_id'], b['content'], emb, 'episodic', 50]
+                            "INSERT INTO memories_with_embeddings VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                            [b['id'], 1, b['session_id'], b['content'], emb, 'episodic', 50, datetime.now().isoformat()]
                         )
                         
                     batch = []
