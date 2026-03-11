@@ -1,101 +1,107 @@
-"""DuckDB local storage server"""
-
-import duckdb
-import asyncio
-from pathlib import Path
-from typing import List, Dict, Any, Optional
-from contextlib import contextmanager
-
-
-class DuckDBServer:
-    """Manages local DuckDB instance for intermediate storage"""
+"""DuckDB local
+[truncated]
+"messages
+[truncated]
+}
+        finally:
+            self.conn.close()
+    def _ensure_tables(self):
+        """Create tables if not exist"""
+        # ... existing code ...
+        
+    def store_users(self, users: List[Dict]):
+        """Store users in local cache"""
+        if not users:
+            return
+        for user in users:
+            self.conn.execute("""
+                INSERT OR REPLACE INTO users_export 
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                user.get('id'), user.get('email'), 
+                user.get('display_name'), user.get('partner_name'),
+                user.get('auth_token'), user.get('created_at')
+            ))
     
-    def __init__(self, db_path: str = "./yuzu_local.duckdb"):
-        self.db_path = Path(db_path)
-        self.conn: Optional[duckdb.DuckDBPyConnection] = None
+    def store_sessions(self, sessions: List[Dict]):
+        """Store sessions in local cache"""
+        if not sessions:
+            return
+        for session in sessions:
+            self.conn.execute("""
+                INSERT OR REPLACE INTO sessions_export
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                session.get('id'), session.get('user_id'),
+                session.get('title'), session.get('created_at'),
+                session.get('updated_at'), session.get('message_count', 0)
+            ))
+    
+    def store_messages(self, messages: List[Dict]):
+        """Store messages in local cache"""
+        if not messages:
+            return
+        for msg in messages:
+            self.conn.execute("""
+                INSERT OR REPLACE INTO messages_export
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                msg.get('id'), msg.get('session_id'), msg.get('user_id'),
+                msg.get('role'), msg.get('content'), msg.get('created_at'),
+                msg.get('session_title', '')
+            ))
+    
+    def get_messages(self) -> List[Dict]:
+        """Get all messages for processing"""
+        cur = self.conn.execute("SELECT * FROM messages_export ORDER BY id")
+        columns = [desc[0] for desc in cur.description]
+        return [dict(zip(columns, row)) for row in cur.fetchall()]
+    
+    def store_episodic_memories(self, memories: List[Dict]):
+        """Store generated episodic memories"""
+        if not memories:
+            return
+        for mem in memories:
+            embedding_json = json.dumps(mem.get('embedding', []))
+            self.conn.execute("""
+                INSERT INTO memories_staging
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                mem.get('user_id'), mem.get('session_id'), mem.get('content'),
+                embedding_json, mem.get('importance', 50),
+                mem.get('memory_type', 'episodic'), mem.get('created_at')
+            ))
+    
+    def store_semantic_memories(self, memories: List[Dict]):
+        """Store generated semantic memories"""
+        if not memories:
+            return
+        for mem in memories:
+            embedding_json = json.dumps(mem.get('embedding', [])) if mem.get('embedding') else '[]'
+            keywords_json = json.dumps(mem.get('keywords', []))
+            self.conn.execute("""
+                INSERT INTO semantic_staging
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                mem.get('user_id'), mem.get('session_id'), mem.get('fact'),
+                mem.get('category'), keywords_json, embedding_json,
+                mem.get('confidence', 0.5)
+            ))
+    
+    def get_memories(self) -> Tuple[List[Dict], List[Dict]]:
+        """Get all staged memories for migration"""
+        # Get episodic
+        cur = self.conn.execute("SELECT * FROM memories_staging")
+        columns = [desc[0] for desc in cur.description]
+        episodic = [dict(zip(columns, row)) for row in cur.fetchall()]
         
-    async def start(self):
-        """Initialize DuckDB with schema"""
-        self.conn = duckdb.connect(str(self.db_path))
-        self._create_schema()
+        # Get semantic  
+        cur = self.conn.execute("SELECT * FROM semantic_staging")
+        columns = [desc[0] for desc in cur.description]
+        semantic = [dict(zip(columns, row)) for row in cur.fetchall()]
         
-    def _create_schema(self):
-        """Create local tables mirroring Supabase structure"""
-        self.conn.execute("""
-            CREATE SEQUENCE IF NOT EXISTS seq_session_id START 10000;
-            CREATE SEQUENCE IF NOT EXISTS seq_memory_id START 10000;
-            
-            -- Raw exported data
-            CREATE TABLE IF NOT EXISTS messages_export (
-                id INTEGER PRIMARY KEY,
-                session_id INTEGER,
-                role TEXT,
-                content TEXT,
-                created_at TIMESTAMP
-            );
-            
-            CREATE TABLE IF NOT EXISTS sessions_export (
-                id INTEGER PRIMARY KEY,
-                title TEXT,
-                created_at TIMESTAMP
-            );
-            
-            -- Processed memories
-            CREATE TABLE IF NOT EXISTS episodic_memories_local (
-                temp_id INTEGER PRIMARY KEY DEFAULT nextval('seq_memory_id'),
-                original_message_id INTEGER,
-                session_id INTEGER,
-                content TEXT,
-                embedding FLOAT[768],
-                importance INTEGER DEFAULT 50,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            
-            CREATE TABLE IF NOT EXISTS semantic_memories_local (
-                temp_id INTEGER PRIMARY KEY DEFAULT nextval('seq_memory_id'),
-                original_message_id INTEGER,
-                fact TEXT,
-                category TEXT,
-                keywords TEXT[],
-                embedding FLOAT[768],
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            
-            CREATE TABLE IF NOT EXISTS processing_log (
-                id INTEGER PRIMARY KEY,
-                phase TEXT,
-                item_count INTEGER,
-                status TEXT,
-                message TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        """)
-        
-    async def stop(self):
-        """Close connection"""
+        return episodic, semantic
+    
+    def close(self):
         if self.conn:
             self.conn.close()
-            self.conn = None
-            
-    def execute(self, sql: str, params: tuple = ()):
-        """Execute SQL"""
-        return self.conn.execute(sql, params)
-        
-    def query(self, sql: str, params: tuple = ()) -> List[Dict[str, Any]]:
-        """Query and return results as dict"""
-        result = self.conn.execute(sql, params).fetchall()
-        columns = [desc[0] for desc in self.conn.description]
-        return [dict(zip(columns, row)) for row in result]
-        
-    def get_stats(self) -> Dict[str, int]:
-        """Get current processing stats"""
-        try:
-            return {
-                'messages_count': self.conn.execute("SELECT COUNT(*) FROM messages_export").fetchone()[0],
-                'sessions_count': self.conn.execute("SELECT COUNT(*) FROM sessions_export").fetchone()[0],
-                'episodic_count': self.conn.execute("SELECT COUNT(*) FROM episodic_memories_local").fetchone()[0],
-                'semantic_count': self.conn.execute("SELECT COUNT(*) FROM semantic_memories_local").fetchone()[0],
-                'embedded_count': self.conn.execute("SELECT COUNT(*) FROM episodic_memories_local WHERE embedding IS NOT NULL").fetchone()[0],
-            }
-        except:
-            return {}

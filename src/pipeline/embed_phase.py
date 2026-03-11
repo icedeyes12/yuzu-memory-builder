@@ -1,170 +1,224 @@
-"""Phase 2: Generate embeddings for episodic and semantic memories"""
+"""Phase 2: Generate embeddings for messages using local ONNX"""
+import os
+import json
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from datetime import datetime
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskID
+import numpy as np
 
-from typing import Dict, List
-from rich.progress import Progress, TaskID
-import re
+
+@dataclass
+class EmbedStats:
+    """Embedding statistics"""
+    messages_embedded: int = 0
+    semantic_facts: int = 0
+    errors: int = 0
+    cached: int = 0
 
 
-class EmbedPhase:
-    """Generate embeddings using ONNX model"""
+def extract_facts_from_message(message: str, session_context: str = "") -> List[Dict]:
+    """Extract semantic facts from a message for memory layer"""
+    facts = []
+    message_lower = message.lower()
     
-    def __init__(self, duckdb_server, onnx_server):
-        self.duckdb = duckdb_server
-        self.onnx = onnx_server
+    # Patterns for fact extraction (simplified - can use LLM for better results)
+    patterns = [
+        # Preferences
+        (r'\b(suka|senang|favorit|prefer)\b.*', 'preference'),
+        (r'\b(gak suka|benci|jijik)\b.*', 'preference'),
         
-    def run(self, progress: Progress, task: TaskID) -> Dict[str, int]:
-        """Process all messages and generate embeddings"""
+        # Identity
+        (r'\b(nama (saya|aku)|panggil (saya|aku))\s+(\w+)', 'identity'),
+        (r'\b(saya|aku)\s+(adalah|kerja|kuliah)\b', 'identity'),
         
-        # Get unprocessed messages
-        messages = self.duckdb.query("""
-            SELECT id, session_id, role, content, created_at
-            FROM messages_export
-            WHERE id NOT IN (SELECT original_message_id FROM episodic_memories_local)
-            ORDER BY id
-        """)
+        # Experience
+        (r'\b(kemarin|minggu lalu|bulan lalu|tahun lalu)\b.*', 'experience'),
+        (r'\b(pernah|sudah)\b.*', 'experience'),
         
-        if not messages:
-            return {'episodic': 0, 'semantic': 0}
-            
-        total = len(messages)
-        processed = 0
-        episodic_count = 0
-        semantic_count = 0
+        # Goals
+        (r'\b(mau|ingin|rencana|target)\b.*', 'goal'),
+        (r'\b(akan|bakal)\b.*', 'goal'),
         
-        # Process in batches of 32 (memory efficient)
-        batch_size = 32
-        
-        for i in range(0, len(messages), batch_size):
-            batch = messages[i:i + batch_size]
-            
-            # Generate episodic memories (all user messages)
-            episodic = self._create_episodic(batch)
-            if episodic:
-                self._save_episodic(episodic)
-                episodic_count += len(episodic)
-                
-            # Generate semantic memories (extract facts)
-            semantic = self._extract_semantic(batch)
-            if semantic:
-                embeddings = self.onnx.embed([s['fact'] for s in semantic])
-                for s, emb in zip(semantic, embeddings):
-                    s['embedding'] = emb
-                self._save_semantic(semantic)
-                semantic_count += len(semantic)
-                
-            processed += len(batch)
-            progress.update(task, completed=processed, total=total)
-            
-        return {
-            'episodic': episodic_count,
-            'semantic': semantic_count
-        }
-        
-    def _create_episodic(self, messages: List[Dict]) -> List[Dict]:
-        """Create episodic memories from messages"""
-        memories = []
-        
-        for msg in messages:
-            # Skip very short messages
-            if len(msg['content']) < 10:
-                continue
-                
-            # Calculate importance (simple heuristic)
-            importance = 50
-            if msg['role'] == 'user':
-                importance += 10
-            if len(msg['content']) > 100:
-                importance += 10
-                
-            memories.append({
-                'original_message_id': msg['id'],
-                'session_id': msg['session_id'],
-                'content': msg['content'][:500],  # Truncate very long
-                'importance': min(importance, 90)
+        # Relationships
+        (r'\b(teman|sahabat|pacar|keluarga|adek|kakak)\b.*', 'relationship'),
+    ]
+    
+    for pattern, category in patterns:
+        import re
+        matches = re.findall(pattern, message, re.IGNORECASE)
+        if matches:
+            facts.append({
+                'fact': message.strip()[:200],  # Truncate long messages
+                'category': category,
+                'keywords': extract_keywords(message),
+                'source': 'pattern_match',
+                'confidence': 0.7
             })
-            
-        return memories
+    
+    return facts
+
+
+def extract_keywords(text: str) -> List[str]:
+    """Extract keywords from text"""
+    # Simple keyword extraction
+    import re
+    
+    # Remove punctuation and split
+    words = re.findall(r'\b[a-zA-Z]{3,}\b', text.lower())
+    
+    # Filter common words
+    stopwords = {'dan', 'atau', 'yang', 'dari', 'untuk', 'dengan', 'ini', 'itu', 'saya', 'aku', 'kamu', 'the', 'and', 'for', 'you'}
+    keywords = [w for w in words if w not in stopwords]
+    
+    # Return unique keywords
+    return list(set(keywords))[:10]  # Max 10 keywords
+
+
+def calculate_importance(message: str, role: str = 'user') -> int:
+    """Calculate importance score for episodic memory"""
+    importance = 50  # Base
+    
+    # Length bonus
+    if len(message) > 100:
+        importance += 10
+    if len(message) > 300:
+        importance += 10
+    
+    # Content indicators
+    indicators_high = ['suka', 'senang', 'favorit', 'important', 'penting', 'ingat', 'remember', 'ga akan lupa']
+    indicators_low = ['halo', 'hi', 'hello', 'apa kabar', 'gimana']
+    
+    msg_lower = message.lower()
+    if any(i in msg_lower for i in indicators_high):
+        importance += 15
+    if any(i in msg_lower for i in indicators_low):
+        importance -= 10
+    
+    # User messages slightly more important
+    if role == 'user':
+        importance += 5
+    
+    return max(10, min(100, importance))
+
+
+class EmbedProcessor:
+    """Process messages and generate embeddings"""
+    
+    def __init__(self, onnx_server, batch_size: int = 32):
+        self.onnx = onnx_server
+        self.batch_size = batch_size
         
-    def _extract_semantic(self, messages: List[Dict]) -> List[Dict]:
-        """Extract semantic facts from messages"""
-        facts = []
+    def process_all(self, messages: List[Dict], progress: Progress) -> Tuple[List[Dict], List[Dict]]:
+        """
+        Process all messages:
+        1. Generate embeddings for episodic memories
+        2. Extract semantic facts
+        """
+        print("\n🔮 Phase 2: Generate Embeddings & Extract Facts\n")
         
-        for msg in messages:
-            content = msg['content']
+        # Create tasks
+        embed_task = progress.add_task("[yellow]Embeddings", total=len(messages))
+        
+        episodic_memories = []
+        semantic_facts = []
+        
+        # Process in batches
+        for i in range(0, len(messages), self.batch_size):
+            batch = messages[i:i + self.batch_size]
             
-            # Pattern 1: "I like...", "I love...", "My favorite..."
-            patterns = [
-                (r'\b(?:suka|like|love|enjoy)\s+(.{10,100})', 'preference'),
-                (r'\b(?:tidak suka|hate|dislike)\s+(.{10,100})', 'preference'),
-                (r'\bfavorite\s+(.{10,50})', 'preference'),
-                (r'\b(?:kerja di|work at|job)\s+(.{10,80})', 'identity'),
-                (r'\b(?:tinggal di|live in|dari)\s+(.{10,50})', 'identity'),
-                (r'\b(?:hobi|hobby)\s+(.{10,100})', 'interest'),
-            ]
+            # Generate embeddings
+            texts = [m['content'] for m in batch]
+            embeddings = self.onnx.embed(texts)
             
-            for pattern, category in patterns:
-                matches = re.finditer(pattern, content, re.IGNORECASE)
-                for match in matches:
-                    fact_text = match.group(1).strip()
-                    if len(fact_text) > 10:
-                        facts.append({
-                            'original_message_id': msg['id'],
-                            'fact': fact_text[:200],
-                            'category': category,
-                            'keywords': self._extract_keywords(fact_text)
+            # Create episodic memories
+            for msg, embedding in zip(batch, embeddings):
+                memory = {
+                    'user_id': msg['user_id'],
+                    'session_id': msg['session_id'],
+                    'content': msg['content'],
+                    'embedding': embedding,
+                    'importance': calculate_importance(msg['content'], msg.get('role', 'user')),
+                    'memory_type': 'episodic',
+                    'context': {
+                        'people': [],
+                        'places': [],
+                        'topics': extract_keywords(msg['content']),
+                        'sentiment': 'neutral'
+                    },
+                    'access_count': 0,
+                    'surprise': 0.5,
+                    'stability': 0,
+                    'difficulty': 0,
+                    'created_at': msg['created_at']
+                }
+                episodic_memories.append(memory)
+                
+                # Extract semantic facts
+                if len(msg['content']) > 20:  # Skip very short messages
+                    facts = extract_facts_from_message(msg['content'])
+                    for fact in facts:
+                        semantic_facts.append({
+                            'user_id': msg['user_id'],
+                            'session_id': msg['session_id'],
+                            'fact': fact['fact'],
+                            'category': fact['category'],
+                            'keywords': fact['keywords'],
+                            'embedding': None,  # Will be generated separately
+                            'source_memory_id': None,  # Will link after insert
+                            'confidence': fact['confidence']
                         })
-                        
-        return facts
-        
-    def _extract_keywords(self, text: str) -> List[str]:
-        """Simple keyword extraction"""
-        # Remove common words
-        stop_words = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'di', 'yang', 'dan'}
-        words = re.findall(r'\b[a-zA-Z]{3,}\b', text.lower())
-        keywords = [w for w in words if w not in stop_words]
-        return list(set(keywords))[:5]  # Max 5 keywords
-        
-    def _save_episodic(self, memories: List[Dict]):
-        """Save to DuckDB"""
-        if not memories:
-            return
             
-        # Get embeddings
-        texts = [m['content'] for m in memories]
-        embeddings = self.onnx.embed(texts)
-        
-        # Insert with embeddings
-        self.duckdb.execute("BEGIN TRANSACTION")
-        for m, emb in zip(memories, embeddings):
-            self.duckdb.execute("""
-                INSERT INTO episodic_memories_local 
-                    (original_message_id, session_id, content, embedding, importance)
-                VALUES (?, ?, ?, ?, ?)
-            """, (
-                m['original_message_id'],
-                m['session_id'],
-                m['content'],
-                emb,
-                m['importance']
-            ))
-        self.duckdb.execute("COMMIT")
-        
-    def _save_semantic(self, facts: List[Dict]):
-        """Save semantic to DuckDB"""
-        if not facts:
-            return
+            progress.update(embed_task, advance=len(batch))
             
-        self.duckdb.execute("BEGIN TRANSACTION")
-        for f in facts:
-            self.duckdb.execute("""
-                INSERT INTO semantic_memories_local
-                    (original_message_id, fact, category, keywords, embedding)
-                VALUES (?, ?, ?, ?, ?)
-            """, (
-                f['original_message_id'],
-                f['fact'],
-                f['category'],
-                f['keywords'],
-                f.get('embedding')
-            ))
-        self.duckdb.execute("COMMIT")
+            if (i // self.batch_size) % 10 == 0:
+                print(f"  ✨ Processed {i}/{len(messages)} messages...")
+        
+        # Generate embeddings for semantic facts
+        if semantic_facts:
+            print(f"\n📝 Generating embeddings for {len(semantic_facts)} semantic facts...")
+            fact_texts = [f['fact'] for f in semantic_facts]
+            fact_embeddings = self.onnx.embed(fact_texts)
+            
+            for fact, embedding in zip(semantic_facts, fact_embeddings):
+                fact['embedding'] = embedding
+        
+        print(f"\n✅ Embedding complete:")
+        print(f"   {len(episodic_memories)} episodic memories")
+        print(f"   {len(semantic_facts)} semantic facts")
+        
+        return episodic_memories, semantic_facts
+
+
+def run_embed_phase(duckdb_server, onnx_server) -> EmbedStats:
+    """Run embed phase - main entry point"""
+    from rich.progress import Progress
+    
+    stats = EmbedStats()
+    
+    # Get messages from DuckDB
+    messages = duckdb_server.get_messages()
+    if not messages:
+        print("❌ No messages to process")
+        return stats
+    
+    print(f"📊 Processing {len(messages)} messages...")
+    
+    processor = EmbedProcessor(onnx_server)
+    
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+    ) as progress:
+        episodic, semantic = processor.process_all(messages, progress)
+    
+    # Store in DuckDB
+    duckdb_server.store_episodic_memories(episodic)
+    duckdb_server.store_semantic_memories(semantic)
+    
+    stats.messages_embedded = len(episodic)
+    stats.semantic_facts = len(semantic)
+    
+    return stats
