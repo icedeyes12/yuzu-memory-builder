@@ -7,7 +7,7 @@ install:
 	@echo "📦 Installing dependencies..."
 	pip install -r requirements.txt
 	@echo "📥 Downloading ONNX model..."
-	python -c "from src.core.onnx_server import ONNXServer; s = ONNXServer(); s.download_model()"
+	python -c "from src.core.onnx_server import download_model; download_model()"
 
 clean:
 	@echo "🧹 Cleaning up..."
