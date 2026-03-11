@@ -24,8 +24,9 @@ class Config(BaseSettings):
     local_db_path: str = Field(default="./yuzu_local.duckdb", alias="LOCAL_DB_PATH")
     
     # Model
-    model_name: str = Field(default="intfloat/multilingual-e5-large", alias="MODEL_NAME")
+    model_name: str = Field(default="intfloat/multilingual-e5-base", alias="MODEL_NAME")
     onnx_threads: int = Field(default=4, alias="ONNX_THREADS")
+    e5_batch_size: int = Field(default=768, alias="E5_BATCH_SIZE")
     
     # Processing
     batch_size: int = Field(default=50, alias="BATCH_SIZE")
